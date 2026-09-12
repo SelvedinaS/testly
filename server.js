@@ -101,6 +101,7 @@ async function initDb(){
     challenges.createIndex({code:1},{unique:true}),
     challenges.createIndex({userId:1}),
     results.createIndex({challengeId:1}),
+    results.createIndex({attemptId:1},{unique:true,sparse:true}),
     favorites.createIndex({userId:1,testId:1},{unique:true}),
     events.createIndex({createdAt:1}),
     events.createIndex({event:1,createdAt:-1}),
@@ -244,18 +245,29 @@ const server=http.createServer(async(req,res)=>{
     }
 
     if(/^\/api\/challenges\/[^/]+\/submit$/.test(u.pathname)&&req.method==='POST'){
+      if(limited(req,'challenge-submit',60,60000))return send(res,429,{error:'Too many attempts'});
       const c=u.pathname.split('/')[3],b=await body(req);
       const item=await challenges.findOne({code:c,active:{$ne:false}});
       if(!item)return send(res,404,{error:'Challenge not found'});
-      const answers=Array.isArray(b.answers)?b.answers:[];
-      let score=0;item.questions.forEach((q,i)=>{if(Number(answers[i])===q.correctIndex)score++;});
+      const answers=Array.isArray(b.answers)?b.answers.map(Number):[];
+      if(answers.length!==item.questions.length||answers.some((v,i)=>!Number.isInteger(v)||v<0||v>=item.questions[i].options.length))
+        return send(res,400,{error:'Incomplete or invalid answers'});
+      const attemptId=text(b.attemptId,120)||crypto.randomUUID();
+      const existing=await results.findOne({attemptId});
+      if(existing)return send(res,200,{score:existing.score,total:existing.total,percent:existing.percent,duplicate:true});
+      let score=0;item.questions.forEach((q,i)=>{if(answers[i]===q.correctIndex)score++;});
       const playerName=text(b.playerName,60)||'Gost';
-      const result={id:crypto.randomUUID(),challengeId:item.id,code:item.code,userId:item.userId,playerName,score,
+      const result={id:crypto.randomUUID(),attemptId,challengeId:item.id,code:item.code,userId:item.userId,playerName,score,
         total:item.questions.length,percent:Math.round(score/item.questions.length*100),createdAt:now()};
       await results.insertOne(result);
-      await events.insertOne({id:crypto.randomUUID(),event:'challenge_complete',visitorId:text(b.visitorId,120),contentId:item.code,contentType:'challenge',
+      const visitor=text(b.visitorId,120);
+      let country='Unknown',countryCode='';
+      const vv=visitor?await visitors.findOne({visitorId:visitor}):null;
+      if(vv){country=vv.country||country;countryCode=vv.countryCode||'';}
+      await events.insertOne({id:crypto.randomUUID(),event:'challenge_complete',visitorId:visitor,contentId:item.code,contentType:'challenge',
         titleBs:item.title,titleEn:item.title,score:result.percent,resultTitle:'',language:item.language,source:safeSource(b.source),referrer:'',page:'/challenge/'+item.code,
-        timezone:'',screenWidth:0,country:'Unknown',countryCode:'',isRegistered:false,userId:'',userName:playerName,userEmail:'',createdAt:now()});
+        timezone:'',screenWidth:0,country,countryCode,isRegistered:false,userId:'',userName:playerName,userEmail:'',createdAt:now()});
+      if(visitor)await visitors.updateOne({visitorId},{$set:{lastSeen:now(),lastLanguage:item.language,lastSource:safeSource(b.source)},$inc:{testsCompleted:1}},{upsert:false});
       return send(res,201,{score,total:item.questions.length,percent:result.percent});
     }
 
